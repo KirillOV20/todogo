@@ -20,7 +20,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Таблица задач
+    # В таблицу задач добавили is_habit (0 - разовое дело, 1 - привычка)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,11 +28,11 @@ def init_db():
             reward INTEGER NOT NULL,
             is_completed INTEGER DEFAULT 0,
             completed_date TEXT,
-            reward_claimed INTEGER DEFAULT 0
+            reward_claimed INTEGER DEFAULT 0,
+            is_habit INTEGER DEFAULT 0
         )
     """)
     
-    # Таблица баланса
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS user_balance (
             id INTEGER PRIMARY KEY,
@@ -41,7 +41,6 @@ def init_db():
     """)
     cursor.execute("INSERT OR IGNORE INTO user_balance (id, balance) VALUES (1, 0)")
     
-    # НОВАЯ ТАБЛИЦА: Товары в магазине
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS shop_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,12 +49,15 @@ def init_db():
         )
     """)
     
-    # Закинем стартовые товары, если магазин пустой
+    # Стартовый пресет магазина по твоей экономике!
     cursor.execute("SELECT COUNT(*) FROM shop_items")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Поиграть в Xbox 1 час', 40)")
-        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Съесть чипсы под сериал', 80)")
-        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Заказать пиццу', 250)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Кастомный обед до 220 грн', 150)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Пачка сигарет', 130)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Картридж + жижа', 550)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Рестик на 500 грн', 500)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Вечер с алкоголем', 350)")
+        cursor.execute("INSERT INTO shop_items (title, price) VALUES ('Вечер в говно', 900)")
         
     conn.commit()
     conn.close()
@@ -63,23 +65,47 @@ def init_db():
 init_db()
 
 
+# --- 2. ЛЕНИВОЕ ОБНОВЛЕНИЕ 2.0 (С ПРИВЫЧКАМИ) ---
 def process_pending_rewards():
     today_str = date.today().isoformat()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Ищем вчерашние выполненные задачи
     cursor.execute("""
-        SELECT id, reward FROM tasks 
+        SELECT id, reward, is_habit FROM tasks 
         WHERE is_completed = 1 AND reward_claimed = 0 AND completed_date < ?
     """, (today_str,))
+    
     pending = cursor.fetchall()
     
     if pending:
-        total = sum(t[1] for t in pending)
-        ids = [t[0] for t in pending]
-        cursor.execute("UPDATE user_balance SET balance = balance + ? WHERE id = 1", (total,))
-        placeholders = ",".join("?" for _ in ids)
-        cursor.execute(f"UPDATE tasks SET reward_claimed = 1 WHERE id IN ({placeholders})", ids)
+        total_coins = sum(t[1] for t in pending)
+        
+        # 1. Зачисляем общий куш на баланс
+        cursor.execute("UPDATE user_balance SET balance = balance + ? WHERE id = 1", (total_coins,))
+        
+        # Разделяем ID на две группы
+        one_off_ids = [t[0] for t in pending if t[2] == 0]
+        habit_ids = [t[0] for t in pending if t[2] == 1]
+        
+        # 2. Разовые дела отправляем в вечный архив (reward_claimed = 1)
+        if one_off_ids:
+            placeholders = ",".join("?" for _ in one_off_ids)
+            cursor.execute(f"UPDATE tasks SET reward_claimed = 1 WHERE id IN ({placeholders})", one_off_ids)
+            
+        # 3. ПРИВЫЧКИ ВОСКРЕШАЕМ! Сбрасываем им статус выполнения на 0
+        if habit_ids:
+            placeholders = ",".join("?" for _ in habit_ids)
+            cursor.execute(f"""
+                UPDATE tasks 
+                SET is_completed = 0, completed_date = NULL, reward_claimed = 0 
+                WHERE id IN ({placeholders})
+            """, habit_ids)
+            
         conn.commit()
+        print(f"[Бэкенд]: Начислено {total_coins} монет! Привычки сброшены на новый круг.")
+        
     conn.close()
 
 
@@ -87,13 +113,8 @@ def process_pending_rewards():
 class TaskCreate(BaseModel):
     title: str
     reward: int
+    is_habit: bool = False  # По умолчанию галочка выключена
 
-class ShopItemCreate(BaseModel):
-    title: str
-    price: int
-
-
-# --- ЭНДПОИНТЫ ЗАДАЧ ---
 
 @app.get("/balance")
 def get_balance():
@@ -110,16 +131,28 @@ def get_tasks():
     process_pending_rewards()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, title, reward, is_completed, completed_date, reward_claimed FROM tasks")
+    cursor.execute("SELECT id, title, reward, is_completed, reward_claimed, is_habit FROM tasks")
     rows = cursor.fetchall()
     conn.close()
-    return [{"id": r[0], "title": r[1], "reward": r[2], "is_completed": bool(r[3]), "reward_claimed": bool(r[5])} for r in rows]
+    return [
+        {
+            "id": r[0], 
+            "title": r[1], 
+            "reward": r[2], 
+            "is_completed": bool(r[3]), 
+            "reward_claimed": bool(r[4]),
+            "is_habit": bool(r[5])
+        } for r in rows
+    ]
 
 @app.post("/tasks")
 def create_task(task: TaskCreate):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO tasks (title, reward) VALUES (?, ?)", (task.title, task.reward))
+    cursor.execute(
+        "INSERT INTO tasks (title, reward, is_habit) VALUES (?, ?, ?)", 
+        (task.title, task.reward, int(task.is_habit))
+    )
     conn.commit()
     conn.close()
     return {"status": "success"}
@@ -151,8 +184,6 @@ def toggle_task(task_id: int):
     conn.close()
     return {"status": "success", "current_balance": curr_balance}
 
-
-# НОВОЕ: УДАЛЕНИЕ ЗАДАЧИ
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: int):
     conn = sqlite3.connect(DB_PATH)
@@ -164,7 +195,6 @@ def delete_task(task_id: int):
         raise HTTPException(status_code=404, detail="Задача не найдена")
         
     reward, is_completed, reward_claimed = task
-    # Если за неё уже выплатили деньги — вычитаем из кошелька при удалении
     if is_completed == 1 and reward_claimed == 1:
         cursor.execute("UPDATE user_balance SET balance = balance - ? WHERE id = 1", (reward,))
         
@@ -172,9 +202,6 @@ def delete_task(task_id: int):
     conn.commit()
     conn.close()
     return {"status": "success"}
-
-
-# --- ЭНДПОИНТЫ МАГАЗИНА ---
 
 @app.get("/shop")
 def get_shop_items():
@@ -189,7 +216,6 @@ def get_shop_items():
 def buy_item(item_id: int):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT title, price FROM shop_items WHERE id = ?", (item_id,))
     item = cursor.fetchone()
     if not item:
@@ -204,17 +230,12 @@ def buy_item(item_id: int):
         conn.close()
         raise HTTPException(status_code=400, detail=f"Не хватает {price - balance} монет!")
         
-    # Списываем бабки
     cursor.execute("UPDATE user_balance SET balance = balance - ? WHERE id = 1", (price,))
     conn.commit()
-    
     cursor.execute("SELECT balance FROM user_balance WHERE id = 1")
     new_bal = cursor.fetchone()[0]
     conn.close()
     return {"status": "success", "new_balance": new_bal, "bought": title}
-
-
-# --- ЭНДПОИНТЫ АДМИНКИ ---
 
 @app.post("/shop")
 def create_shop_item(item: ShopItemCreate):
